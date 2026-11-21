@@ -1,0 +1,6 @@
+/target
+# 秘密情報・実データ (コミットしない)
+.env
+.vrc_auth
+bot.db
+bot.db-*
