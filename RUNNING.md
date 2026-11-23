@@ -22,6 +22,13 @@ VRC_USERNAME=...             # VRChatのユーザー名 (メールアドレス�
 VRC_PASSWORD=...
 VRC_USER_AGENT=VRCFriendBot/1.0 your-email@example.com   # VRChat APIの規約どおり連絡先を入れる
 # STATS_TZ=Asia/Tokyo        # 統計の時間帯(省略時は Asia/Tokyo)
+
+# --- ここから下は Python版と並べて動かすときの設定 (詳しくは 6.) ---
+# BOT_DB=bot-rs.db           # 登録フレンドとチャンネル・言語/メンション設定の保存先 (Python版の bot.db とは別ファイル。省略時 bot-rs.db)
+# STATS_DB=/絶対パス/bot.db   # ログイン記録を持つDB。Python版の bot.db を指すと、記録を共有できる。指定すると既定は読み取り専用
+# STATS_MODE=readonly        # readonly = 記録せず読むだけ / record = 記録する。STATS_DB を指定したときの既定は readonly
+# FRIEND_CATEGORY=VRC-Friends-rs   # フレンド用チャンネルを作るカテゴリの名前 (無ければ作る。省略時この名前)
+# FRIEND_CATEGORY_ID=123456789     # 名前でなく、既存のカテゴリをIDで指定する場合 (これを指定すると名前は無視)
 # RUST_LOG=info              # ログの量。既定は「このBotのログだけ info、依存ライブラリは warn 以上」
 #                            # 詳しく見たいとき: RUST_LOG=debug  /  RUST_LOG=info,serenity=debug
 ```
@@ -97,12 +104,66 @@ journalctl -u vrc-friend-bot -f     # ログを見る
 > サーバーが ARM (Oracle Cloud の Ampere など) でPCがx86の場合、PCでビルドしたファイルは動かない。
 > サーバー上で `cargo build --release` するか (メモリが少なければ `-j1` やスワップを足す)、`cross` で aarch64 向けにビルドする。
 
-## 6. Python版からの切り替え
+## 6. Python版と並べて動かす / 切り替える
 
-1. Python版を止める (`sudo systemctl stop ...`)。**両方を同時に動かさない** (通知が二重になり、同じ `bot.db` に同時に書き込むため)
-2. `bot.db` `.env` `.vrc_auth` をバックアップする
-3. それらをRust版のフォルダにコピーして起動する (テーブルは同じ形なので変換は不要)
-4. 戻したいときは、Rust版を止めてPython版を起動すればよい (Rust版が足すテーブルはPython版と同じ)
+**考え方**: データは「共有するもの」と「Botごとに別のもの」に分ける。
+
+| データ | 置き場所 | 理由 |
+|---|---|---|
+| ログイン記録 (`activity` `vrc_friends` `stats_meta`) | **共有** (長く溜めたPython版の `bot.db` を `STATS_DB` で参照) | VRChatアカウントの事実で、Botごとに違わない |
+| 登録フレンドとチャンネルID (`friends`)・言語/メンション設定 (`bot_settings`) | **Botごとに別** (`BOT_DB`) | DiscordのチャンネルはBotごとに違う |
+
+登録は別ファイルなので、**Python版の25人がRust版に勝手に読み込まれて、存在しないチャンネルに通知を送ることはない**。
+片方で `/remove` しても、もう片方には影響しない。
+
+### 手順 (Python版は動かしたまま始められる)
+
+1. **(任意・推奨) 共有DBをWALモードにする**。Python版が書き込み中でも、Rust版が同時に読めるようになる。DBファイルに永続する設定で、1回だけ。
+   ```
+   python3 -c "import sqlite3; print(sqlite3.connect('/絶対パス/bot.db').execute('PRAGMA journal_mode=WAL').fetchone())"
+   ```
+2. Rust版の `.env` に追加する:
+   ```
+   BOT_DB=bot-rs.db
+   STATS_DB=/絶対パス/bot.db        # Python版の bot.db
+   FRIEND_CATEGORY=VRC-Friends-rs
+   ```
+   `STATS_DB` を指定したので **既定は読み取り専用** (`STATS_MODE=readonly`)。記録はPython版が続け、
+   Rust版は読むだけ (通知・`/stats`・`/add` の候補は動く)。**記録が二重にならない** (ログイン回数が2倍になるのを防ぐ)。
+   読み取り専用のあいだは、共有DBに1行も書かない (書こうとしてもDB側が拒否する)。
+3. 起動して、テスト用に1人 `/add` してみる。`VRC-Friends-rs` カテゴリにチャンネルが作られる。
+4. **25人の登録を移す** (元のDBは読むだけで、書き換えない):
+   ```
+   ./vrc-friend-bot import /絶対パス/bot.db            # まず確認だけ。誰がどうなるか一覧が出る
+   ./vrc-friend-bot import /絶対パス/bot.db --apply    # 実行: VRC-Friends-rs に新しいチャンネルを作って登録
+   ./vrc-friend-bot check                              # 登録フレンドのチャンネルが実在してBotから見えるか確認
+   ```
+   - 言語とメンションの設定も、こちらに無いものだけコピーされる。
+   - 何度実行しても、登録済みの人は飛ばされる (チャンネルが増えない)。失敗した人だけやり直せる。
+   - 存在しないチャンネルは登録しない。`check` は、存在しない/見えないチャンネルを一覧にする。
+5. しばらく両方を動かして、通知と `/stats` を見比べる。**同じ人の通知が、Python版のチャンネルとRust版のチャンネルに両方届く**(別チャンネルなので混ざらない)。
+
+### Rust版を「記録担当」に切り替える (Python版をやめる日)
+
+1. Python版を止める。
+2. `.env` の `STATS_MODE=record` にして (または行を消さず `STATS_MODE=record` を足して) 起動する。
+   以後、Rust版が同じ `bot.db` にそのまま記録を続ける (テーブルの形は同じ)。
+3. 念のため: Python版がまだ動いている間に `record` で起動すると、**起動を断る**
+   (「別のBotが記録中」。`STATS_FORCE=1` で承知の上なら続けられる)。
+4. チャンネルをそのまま引き継ぎたいとき (新しいチャンネルを作りたくないとき) は、Python版を止めたあとで
+   `import ... --apply --reuse-channels` を使う。Python版のチャンネルIDをそのまま登録する (実在しなければ登録しない)。
+   **Python版を止める前には使わない** (同じチャンネルに2つのBotが書き込むため)。
+
+### 戻したいとき
+
+Rust版を止めて、Python版を起動すればよい (統計テーブルは同じ形。Rust版は `alive` と `rust_alive` を足すだけ)。
+
+### 完全に引っ越す場合 (共有せず、全部コピーする)
+
+`bot.db` をRust版のフォルダにコピーして `BOT_DB=bot.db` にし、`STATS_DB` は指定しない。1つのファイルに登録と記録が入り、
+Rust版が記録も担当する。Python版は必ず止めてから。
+
+> `BOT_DB` に置いたDBはRust版だけが使う。`STATS_DB` と `BOT_DB` を**同じファイルにはできない** (登録を共有してしまうため。起動時に断る)。
 
 ## 7. 動作確認チェックリスト
 

@@ -10,7 +10,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const CATEGORY: &str = "VRC-Friends";
+/// Python版の "VRC-Friends" とは別のカテゴリにする (同じサーバーで両方動かしても混ざらない)
+pub const DEFAULT_CATEGORY: &str = "VRC-Friends-rs";
+
+/// フレンド用チャンネルを作るカテゴリの指定: 名前(無ければ作る) または ID(既存のカテゴリ)
+#[derive(Debug, Clone)]
+pub enum CategorySpec {
+    Name(String),
+    Id(u64),
+}
 
 // ---------- コア -> Discord (書き込み) ----------
 
@@ -18,6 +26,7 @@ pub struct DiscordApi {
     http: OnceLock<Arc<Http>>,
     guild: GuildId,
     rt: tokio::runtime::Handle,
+    category: CategorySpec,
 }
 
 fn status_of(e: &serenity::Error) -> Option<u16> {
@@ -36,7 +45,11 @@ fn derr(e: serenity::Error) -> DiscordError {
 
 impl DiscordApi {
     pub fn new(guild_id: u64, rt: tokio::runtime::Handle) -> Self {
-        DiscordApi { http: OnceLock::new(), guild: GuildId::new(guild_id), rt }
+        DiscordApi { http: OnceLock::new(), guild: GuildId::new(guild_id), rt, category: CategorySpec::Name(DEFAULT_CATEGORY.into()) }
+    }
+    pub fn with_category(mut self, c: CategorySpec) -> Self {
+        self.category = c;
+        self
     }
     /// クライアントを作ったあとにHTTPクライアントを渡す (コアはクライアントより先に作るため)。
     pub fn set_http(&self, http: Arc<Http>) {
@@ -90,13 +103,30 @@ impl Discord for DiscordApi {
                 Err(e) => return Err(derr(e)),
             }
         }
-        let chans = self.rt.block_on(self.guild.channels(&http)).map_err(derr)?;
-        let cat = match chans.values().find(|c| c.kind == ChannelType::Category && c.name == CATEGORY) {
-            Some(c) => c.id,
-            None => self.rt.block_on(self.guild.create_channel(&http, CreateChannel::new(CATEGORY).kind(ChannelType::Category))).map_err(derr)?.id,
+        let cat = match &self.category {
+            CategorySpec::Id(id) => match self.rt.block_on(http.get_channel(ChannelId::new(*id))).map_err(derr)? {
+                Channel::Guild(g) if g.kind == ChannelType::Category => g.id,
+                _ => return Err(DiscordError { status: None, message: format!("FRIEND_CATEGORY_ID={id} はカテゴリではありません") }),
+            },
+            CategorySpec::Name(name) => {
+                let chans = self.rt.block_on(self.guild.channels(&http)).map_err(derr)?;
+                match chans.values().find(|c| c.kind == ChannelType::Category && &c.name == name) {
+                    Some(c) => c.id,
+                    None => self.rt.block_on(self.guild.create_channel(&http, CreateChannel::new(name).kind(ChannelType::Category))).map_err(derr)?.id,
+                }
+            }
         };
         let ch = self.rt.block_on(self.guild.create_channel(&http, CreateChannel::new(chan_name).kind(ChannelType::Text).category(cat).topic(uid))).map_err(derr)?;
         Ok(ch.id.get() as i64)
+    }
+
+    fn channel_exists(&self, channel_id: i64) -> Result<bool, DiscordError> {
+        let http = self.http()?;
+        match self.rt.block_on(http.get_channel(ChannelId::new(channel_id as u64))) {
+            Ok(_) => Ok(true),
+            Err(e) if matches!(status_of(&e), Some(404) | Some(403)) => Ok(false), // 無い / 見えない
+            Err(e) => Err(derr(e)),
+        }
     }
 }
 

@@ -2,6 +2,7 @@
 pub mod bot;
 pub mod db;
 pub mod i18n;
+pub mod import;
 pub mod logic;
 mod i18n_table;
 pub mod stats;

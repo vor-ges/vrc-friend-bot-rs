@@ -53,6 +53,9 @@ impl Discord for NoDiscord {
     fn friend_channel(&self, e: Option<i64>, _: &str, _: &str) -> Result<i64, DiscordError> {
         Ok(e.unwrap_or(1))
     }
+    fn channel_exists(&self, _: i64) -> Result<bool, DiscordError> {
+        Ok(true)
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

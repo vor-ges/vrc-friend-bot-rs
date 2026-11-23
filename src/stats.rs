@@ -92,6 +92,8 @@ pub struct Stats {
     tz: Tz,
     /// 前回プロセスが最後に生きていた時刻 (起動時の照合用)
     pub prev_alive: Option<f64>,
+    /// true のとき、統計DBには一切書かない (他のBot=Python版が記録しているDBを読むだけで使う)
+    readonly: bool,
 }
 
 #[derive(Default)]
@@ -129,9 +131,41 @@ impl Stats {
             )?;
             conn.execute("INSERT OR IGNORE INTO stats_meta(k,v) VALUES('since', ?)", [now().to_string()])?;
         }
-        let mut s = Stats { c, tz, prev_alive: None };
+        let mut s = Stats { c, tz, prev_alive: None, readonly: false };
         s.prev_alive = s.meta("alive")?;
         Ok(s)
+    }
+
+    /// 読み取り専用で開く。テーブルが無ければ(パスの間違い)エラー。書き込みはDB側でも禁止される。
+    /// このとき記録系(履歴の追記・名簿の更新・生存記録・同期の補正)は何もしない。通知と集計は動く。
+    pub fn new_readonly(c: Conn, tz: Tz) -> Result<Self, String> {
+        {
+            let conn = lock(&c);
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('activity','vrc_friends','stats_meta')", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            if n < 3 {
+                return Err("統計テーブル(activity / vrc_friends / stats_meta)が見つかりません。STATS_DB に Python版の bot.db のパスを指定してください".into());
+            }
+            conn.pragma_update(None, "query_only", true).map_err(|e| e.to_string())?;
+        }
+        let mut s = Stats { c, tz, prev_alive: None, readonly: true };
+        s.prev_alive = s.meta("alive").map_err(|e| e.to_string())?;
+        Ok(s)
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// 別のプロセス(Python版)が、いま記録を続けているか。生存記録(alive)が window 秒以内で、
+    /// それがこのRust版が書いたもの(rust_alive)ではないとき true。記録の二重書き込みを避けるための確認。
+    pub fn foreign_writer_active(&self, window: f64) -> rusqlite::Result<bool> {
+        let (alive, mine) = (self.meta("alive")?, self.meta("rust_alive")?);
+        Ok(match alive {
+            Some(a) if now() - a < window => mine.map_or(true, |m| a - m > 5.0), // 自分が書いた alive なら rust_alive と同時刻
+            _ => false,
+        })
     }
 
     pub fn tz(&self) -> Tz {
@@ -155,10 +189,14 @@ impl Stats {
     }
 
     pub fn heartbeat(&self) {
-        let r = lock(&self.c).execute(
-            "INSERT INTO stats_meta(k,v) VALUES('alive',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-            [now().to_string()],
-        );
+        if self.readonly {
+            return;
+        }
+        let t = now().to_string();
+        let c = lock(&self.c);
+        let r = c
+            .execute("INSERT INTO stats_meta(k,v) VALUES('alive',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [&t])
+            .and_then(|_| c.execute("INSERT INTO stats_meta(k,v) VALUES('rust_alive',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", [&t])); // Rust版が書いた印
         if let Err(e) = r {
             log::error!("stats heartbeat failed: {e}");
         }
@@ -169,6 +207,9 @@ impl Stats {
     /// 新規の収集開始日時: 既に履歴があればその最初の時刻まで遡る。
     /// hint(Discord登録日時)があれば統計開始以降でそれを使う。
     pub fn upsert_friend(&self, uid: &str, name: Option<&str>, hint: Option<f64>) -> rusqlite::Result<bool> {
+        if self.readonly {
+            return Ok(false);
+        }
         let t = now();
         let name = name.filter(|n| !n.is_empty());
         let since = self.since()?;
@@ -198,6 +239,9 @@ impl Stats {
     }
 
     pub fn mark_unfriended(&self, uid: &str) -> rusqlite::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
         lock(&self.c).execute("UPDATE vrc_friends SET is_friend=0, updated_at=? WHERE uid=?", params![now(), uid])?;
         Ok(())
     }
@@ -256,6 +300,9 @@ impl Stats {
     // ---------- 記録 ----------
     /// 履歴を1行追記する。失敗しても通知処理は止めない(ログだけ残す)。
     pub fn record(&self, uid: &str, kind: &str, status: Option<&str>, ts: Option<f64>) {
+        if self.readonly {
+            return;
+        }
         let r = lock(&self.c).execute(
             "INSERT INTO activity(uid,ts,kind,status) VALUES(?,?,?,?)",
             params![uid, ts.unwrap_or_else(now), kind, status],
@@ -282,6 +329,9 @@ impl Stats {
 
     /// 履歴と現在の実状態(online_now)を突き合わせて、停止中などで生じたズレを補正する。
     pub fn reconcile(&self, uid: &str, online_now: bool, status: Option<&str>, close_at: Option<f64>) -> rusqlite::Result<()> {
+        if self.readonly {
+            return Ok(());
+        }
         let (logged, last_status, last_ts) = self.state(uid)?;
         if online_now && !logged {
             self.record(uid, "resume", status, None);

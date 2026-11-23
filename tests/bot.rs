@@ -97,6 +97,7 @@ struct Sent {
 struct FakeDiscord {
     sent: Mutex<Vec<Sent>>,
     created: Mutex<Vec<(String, String)>>, // (uid, チャンネル名)
+    missing: Mutex<std::collections::HashSet<i64>>, // 存在しない(見えない)チャンネル
 }
 
 impl Discord for FakeDiscord {
@@ -111,6 +112,9 @@ impl Discord for FakeDiscord {
         let mut c = self.created.lock().unwrap();
         c.push((uid.to_string(), name.to_string()));
         Ok(900 + c.len() as i64)
+    }
+    fn channel_exists(&self, ch: i64) -> Result<bool, DiscordError> {
+        Ok(!self.missing.lock().unwrap().contains(&ch))
     }
 }
 
@@ -868,4 +872,57 @@ fn stats_who_works_without_registration() {
     assert!([&a_, &r_, &b_, &u_, &l_].iter().all(|u| vals.contains(*u)) && c.ac_who(1, "").is_empty());
     let r = c.ac_who(OWNER, "unf");
     assert_eq!(r.iter().map(|x| (x.name.split(' ').next().unwrap().to_string(), x.value.clone())).collect::<Vec<_>>(), [("Unfr".to_string(), u_.clone())]);
+}
+
+// ---------- 記録は他のBot(Python版)に任せ、通知・集計・/add だけ動かす ----------
+
+#[test]
+fn readonly_stats_mode_notifies_but_never_writes_to_the_shared_db() {
+    let _g = serial();
+    // 記録担当(Python版に相当)が作った統計DB
+    let path = std::env::temp_dir().join(format!("vrcrs-ro-core-{}.db", std::process::id())).to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&path);
+    {
+        let w = Stats::new(vrc_friend_bot_rs::db::open_conn(&path, false).unwrap(), Tokyo).unwrap();
+        lock(&w.conn()).execute("UPDATE stats_meta SET v=? WHERE k='since'", [t(1, 0, 0).to_string()]).unwrap();
+        for (u, n) in [("usr_a", "Alice"), ("usr_b", "Bob")] {
+            w.upsert_friend(u, Some(n), None).unwrap();
+        }
+        lock(&w.conn()).execute("UPDATE vrc_friends SET tracked_since=?", [t(1, 0, 0)]).unwrap(); // 収集開始は過去
+        w.record("usr_a", "login", Some("busy"), Some(t(2, 20, 0)));
+        w.record("usr_a", "logout", None, Some(t(2, 21, 0)));
+        w.heartbeat();
+    }
+    let snapshot = |p: &str| {
+        let c = rusqlite::Connection::open(p).unwrap();
+        let q = |sql: &str| c.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap();
+        (q("SELECT group_concat(uid||kind||ts) FROM activity"), q("SELECT group_concat(uid||name||is_friend||tracked_since) FROM vrc_friends"), q("SELECT group_concat(k||v) FROM stats_meta"))
+    };
+    let before = snapshot(&path);
+
+    // Rust版: 登録(friends)は別DB、統計は上のDBを読み取り専用で参照
+    let db = Db::memory().unwrap();
+    let stats = Stats::new_readonly(vrc_friend_bot_rs::db::open_conn(&path, true).unwrap(), Tokyo).unwrap();
+    let (v, d) = (Arc::new(FakeVrc::default()), Arc::new(FakeDiscord::default()));
+    let c = Core::new(db, stats, v.clone(), d.clone(), Config { main_ch: MAIN, owner: OWNER });
+    c.db.upsert("usr_a", "Alice", 111).unwrap();
+
+    // 通知は従来どおり届く (ゲーム内の状態はメモリ上で追う)
+    ev(&c, "friend-online", "usr_a", json!({"platform":"android","location":"private","user":{"status":"active","displayName":"Alice"}}));
+    ev(&c, "friend-update", "usr_a", json!({"user":{"status":"busy"}}));
+    ev(&c, "friend-offline", "usr_a", json!({}));
+    assert_eq!(d.titles()[0], "🟢 Alice がオンライン");
+    assert_eq!(d.titles().last().unwrap(), "⚫ Alice がオフライン");
+    // 新しいフレンドの追加・解除・同期の補正も、共有DBには書かない
+    ev(&c, "friend-add", "usr_n", json!({"user":{"displayName":"Newbie"}}));
+    ev(&c, "friend-delete", "usr_b", json!({}));
+    *v.friends.lock().unwrap() = vec![entry("usr_a", "Alice", true, "active", None), entry("usr_x", "Xavier", false, "active", None)];
+    c.sync_friends();
+    c.stats.heartbeat();
+    assert_eq!(snapshot(&path), before, "読み取り専用のあいだ、共有DBは1行も変わらない");
+
+    // 集計と /add の候補は、共有DBの記録をそのまま使う
+    let em = c.cmd_stats(OWNER, 111, None, None).embed.unwrap();
+    assert!(em.title.unwrap().contains("Alice") && em.description.unwrap().contains("**ゲーム内ログイン**: 1回"));
+    assert!(c.add_candidates().iter().any(|r| r.uid == "usr_b")); // 共有の名簿にいる人が候補に出る
 }

@@ -162,3 +162,78 @@ fn heartbeat_and_prev_alive() {
     assert!((s2.prev_alive.unwrap() - now()).abs() < 5.0);
     assert_eq!(make_tz("No/Such_Zone"), Tokyo); // 読めなければ UTC+9
 }
+
+// ---------- 他のBot(Python版)が記録しているDBを、読み取り専用で参照する ----------
+
+fn temp_db(name: &str) -> String {
+    let p = std::env::temp_dir().join(format!("vrcrs-{}-{}-{name}.db", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    p.to_string_lossy().to_string()
+}
+
+fn counts(path: &str) -> (i64, i64, i64, String) {
+    let c = rusqlite::Connection::open(path).unwrap();
+    let n = |t: &str| c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get::<_, i64>(0)).unwrap();
+    let meta: String = c.query_row("SELECT group_concat(k||'='||v) FROM (SELECT k,v FROM stats_meta ORDER BY k)", [], |r| r.get(0)).unwrap();
+    (n("activity"), n("vrc_friends"), n("stats_meta"), meta)
+}
+
+#[test]
+fn readonly_stats_reads_but_never_writes() {
+    let path = temp_db("ro");
+    {
+        // 記録担当のBot(Python版に相当)が作ったDB
+        let c = vrc_friend_bot_rs::db::open_conn(&path, false).unwrap();
+        let w = Stats::new(c, Tokyo).unwrap();
+        w.upsert_friend("usr_a", Some("Alice"), None).unwrap();
+        w.record("usr_a", "login", Some("busy"), Some(t(2, 20, 0)));
+        w.record("usr_a", "logout", None, Some(t(2, 21, 0)));
+        w.heartbeat();
+    }
+    let before = counts(&path);
+    let s = Stats::new_readonly(vrc_friend_bot_rs::db::open_conn(&path, true).unwrap(), Tokyo).unwrap();
+    assert!(s.is_readonly());
+    // 読み取りは動く
+    assert_eq!(s.friend("usr_a").unwrap().unwrap().name.as_deref(), Some("Alice"));
+    assert_eq!(s.summarize(&["usr_a"], t(1, 0, 0), t(3, 0, 0)).unwrap().total.seconds, 3600.0);
+    assert!(s.prev_alive.is_some());
+    // 書き込み系は何もしない (エラーにもしない)
+    s.record("usr_a", "login", Some("active"), Some(t(3, 1, 0)));
+    s.heartbeat();
+    assert!(!s.upsert_friend("usr_new", Some("New"), None).unwrap());
+    s.mark_unfriended("usr_a").unwrap();
+    s.reconcile("usr_a", true, Some("active"), None).unwrap();
+    assert!(s.friend("usr_new").unwrap().is_none() && s.friend("usr_a").unwrap().unwrap().is_friend);
+    // それでも書こうとしたら、DB側が拒否する
+    let cn = s.conn();
+    let e = vrc_friend_bot_rs::db::lock(&cn).execute("DELETE FROM activity", []).unwrap_err();
+    assert!(e.to_string().contains("readonly"), "{e}");
+    drop(s);
+    assert_eq!(counts(&path), before, "読み取り専用のあいだ、DBの中身は1行も変わらない");
+}
+
+#[test]
+fn readonly_requires_existing_stats_tables() {
+    let path = temp_db("empty");
+    let c = vrc_friend_bot_rs::db::open_conn(&path, false).unwrap();
+    vrc_friend_bot_rs::db::lock(&c).execute_batch("CREATE TABLE friends(uid TEXT)").unwrap(); // 統計テーブルが無いDB(パスの間違い)
+    let e = Stats::new_readonly(c, Tokyo).err().unwrap();
+    assert!(e.contains("STATS_DB"), "{e}");
+}
+
+#[test]
+fn foreign_writer_is_detected_so_two_bots_do_not_both_record() {
+    let path = temp_db("writer");
+    let c = vrc_friend_bot_rs::db::open_conn(&path, false).unwrap();
+    let s = Stats::new(c.clone(), Tokyo).unwrap();
+    let set = |k: &str, v: f64| {
+        vrc_friend_bot_rs::db::lock(&c).execute("INSERT INTO stats_meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", rusqlite::params![k, v.to_string()]).unwrap();
+    };
+    assert!(!s.foreign_writer_active(180.0).unwrap()); // 誰も記録していない
+    s.heartbeat(); // 自分(Rust版)が記録している -> 他のBotではない
+    assert!(!s.foreign_writer_active(180.0).unwrap());
+    set("alive", now()); // Python版の生存記録 (rust_alive は書かない)
+    set("rust_alive", now() - 100.0);
+    assert!(s.foreign_writer_active(180.0).unwrap()); // 他のBotが記録中
+    set("alive", now() - 1000.0);
+    assert!(!s.foreign_writer_active(180.0).unwrap()); // 古い記録は無視 (Python版は止まっている)
+}

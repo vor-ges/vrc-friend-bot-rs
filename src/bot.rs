@@ -72,6 +72,8 @@ pub trait Discord: Send + Sync {
     /// フレンド用チャンネルを返す。existing が実在すればそれを再利用し、無ければ「VRC-Friends」カテゴリ
     /// (無ければ作る)の下に `chan_name` で作って topic に uid を入れる。
     fn friend_channel(&self, existing: Option<i64>, chan_name: &str, uid: &str) -> Result<i64, DiscordError>;
+    /// チャンネルが存在し、Botから見えるか (見えない・存在しないなら false)
+    fn channel_exists(&self, channel_id: i64) -> Result<bool, DiscordError>;
 }
 
 // ---------- 返答 ----------

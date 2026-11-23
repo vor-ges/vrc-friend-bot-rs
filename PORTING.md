@@ -50,10 +50,17 @@ d148bebbe22dee80c3ca9c00a8e47df91adb5908701328b06156d6d03acc7913  README.ja.md
 | `bot.py` のDiscord操作・ボタン・コマンド登録 | `src/discord.rs` | ✅ 完了 (**実機確認はこれから**) |
 | `bot.py` の `ws_loop` | `src/ws.rs` | ✅ 完了 (手元のWebSocketサーバーでテスト済み / 実機確認はこれから) |
 | `bot.py` の起動 (`Bot().run`) | `src/main.rs` | ✅ 完了 (**実機確認はこれから**) |
-| `test_local.py` | `tests/*.rs` | 全35件。Discord.py固有のテスト(コマンドツリー等)は `tests/discord_defs.rs` で定義を直接検証 |
+| (新規) 登録の取り込み・チャンネル確認 | `src/import.rs` | ✅ 完了 (`import` / `check` サブコマンド) |
+| `test_local.py` | `tests/*.rs` | 全45件。Discord.py固有のテスト(コマンドツリー等)は `tests/discord_defs.rs` で定義を直接検証 |
 
 DBスキーマ (`friends` / `activity` / `stats_meta` / `vrc_friends` / `bot_settings`) は
 既存の `bot.db` と互換を保つ (同じ `bot.db` をPython版とRust版が読める)。
+
+**DBの分け方** (`RUNNING.md` の 6.): ログイン記録(`activity` `vrc_friends` `stats_meta`)は共有できる(`STATS_DB`)が、
+登録フレンドとチャンネル・設定(`friends` `bot_settings`)はBotごとに別(`BOT_DB`)。
+`STATS_DB` を指定したときの既定は `STATS_MODE=readonly` で、Rust版は共有DBに一切書かない (`PRAGMA query_only` でDB側でも禁止)。
+記録担当は1つだけにする: `record` で起動するとき、別のBotが `alive` を更新中なら起動を断る (`rust_alive` で自分の記録と区別)。
+フレンド用カテゴリは既定で `VRC-Friends-rs` (Python版の `VRC-Friends` とは別)。`FRIEND_CATEGORY` / `FRIEND_CATEGORY_ID` で変えられる。
 
 ## Python版との意図的な違い
 
@@ -69,6 +76,7 @@ DBスキーマ (`friends` / `activity` / `stats_meta` / `vrc_friends` / `bot_set
 - Discordは serenity を**キャッシュ無し**・`GUILDS` intent のみで使う。フレンド用チャンネルの存在確認はその都度HTTP(404なら作り直す)。
 - ボタン(確認 / 一覧のページ送り)の状態はメモリ上 (Python版と同じく、再起動するとボタンは効かなくなる)。
 - 人数表示で `n_users` が取れなかったとき、Python版は "None/16" と出すところを "?/16" にした。
+- 設定項目を追加: `BOT_DB` `STATS_DB` `STATS_MODE` `STATS_FORCE` `FRIEND_CATEGORY` `FRIEND_CATEGORY_ID` (Python版にはない)。
 - `esc()` は discord.py 2.7 の `escape_markdown`(見出し `#` と箇条書き `-` のエスケープを含む)に合わせてある。
 
 - `vrc.py` は vrchatapi SDK をやめ、同期クライアント `ureq`(rustls) + `serde_json::Value` で必要な8本のAPIだけを直接呼ぶ。
